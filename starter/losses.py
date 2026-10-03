@@ -18,9 +18,18 @@ def build_criterion(kind: str = "ce", **kw):
     Ví dụ kw: smoothing=0.1, gamma=2.0, alpha=None, weight=tensor.
     TODO: tạo đúng loss, hoặc gọi các lớp bên dưới.
     """
-    raise NotImplementedError("TODO")
+    if kind == "ce":
+        return nn.CrossEntropyLoss()
+    elif kind == "ls":
+        return LabelSmoothingCE(smoothing=kw.get("smoothing", 0.1))
+    elif kind == "focal":
+        return FocalLoss(gamma=kw.get("gamma", 2.0), alpha=kw.get("alpha", None))
+    elif kind == "ce_weighted":
+        return nn.CrossEntropyLoss(weight=kw.get("weight", None))
+    else:
+        raise ValueError(f"Unknown criterion kind: {kind}")
 
-
+import torch.nn as nn
 class LabelSmoothingCE:  # TODO: kế thừa torch.nn.Module
     """Cross-entropy với label smoothing: q'(k) = (1 - eps) * 1[k == y] + eps / K  (slide trang 56).
 
@@ -29,7 +38,10 @@ class LabelSmoothingCE:  # TODO: kế thừa torch.nn.Module
     """
 
     def __init__(self, smoothing: float = 0.1):
-        raise NotImplementedError("TODO")
+        super().__init__()
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=smoothing)
+    def forward(self, logits, targets):
+        return self.criterion(logits, targets)
 
 
 class FocalLoss:  # TODO: kế thừa torch.nn.Module
@@ -42,9 +54,23 @@ class FocalLoss:  # TODO: kế thừa torch.nn.Module
     """
 
     def __init__(self, gamma: float = 2.0, alpha=None):
-        raise NotImplementedError("TODO")
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
 
+    def forward(self, logits, targets):
+        ce_loss = nn.functional.cross_entropy(logits, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
+            
+        return focal_loss.mean()
 
+import torch
+import numpy as np
 def class_weights(counts, beta: float = 0.0):
     """Trọng số theo lớp từ số ảnh mỗi lớp trong tập TRAIN.
 
@@ -54,8 +80,12 @@ def class_weights(counts, beta: float = 0.0):
 
     TODO: trả về tensor độ dài 9. Chỉ dùng số liệu của train, không dùng val hay test.
     """
-    raise NotImplementedError("TODO")
-
+    counts = np.array(counts)
+    if beta == 0.0:
+        w = 1.0 / counts
+    else:
+        w = (1 - beta) / (1 - beta**counts)
+    return torch.tensor(w / w.sum(), dtype=torch.float32)
 
 def mix_batch(x, y, alpha: float = 1.0, mode: str = "cutmix"):
     """Trộn một batch ảnh và nhãn.
@@ -68,7 +98,36 @@ def mix_batch(x, y, alpha: float = 1.0, mode: str = "cutmix"):
 
     TODO: tự cài đặt. Kiểm tra bằng mắt: vẽ vài ảnh sau khi trộn và in lam.
     """
-    raise NotImplementedError("TODO")
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size).to(x.device)
+    
+    if mode == "mixup":
+        x_mixed = lam * x + (1 - lam) * x[index]
+    elif mode == "cutmix":
+        W = x.size()[2]
+        H = x.size()[3]
+        cut_rat = np.sqrt(1. - lam)
+        cut_w = int(W * cut_rat)
+        cut_h = int(H * cut_rat)
+        
+        cx = np.random.randint(W)
+        cy = np.random.randint(H)
+        
+        bbx1 = np.clip(cx - cut_w // 2, 0, W)
+        bby1 = np.clip(cy - cut_h // 2, 0, H)
+        bbx2 = np.clip(cx + cut_w // 2, 0, W)
+        bby2 = np.clip(cy + cut_h // 2, 0, H)
+        
+        x_mixed = x.clone()
+        x_mixed[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
+        lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (W * H))
+    else:
+        x_mixed = x
+        lam = 1.0
+        
+    y_a, y_b = y, y[index]
+    return x_mixed, (y_a, y_b, lam)
 
 
 def mixed_loss(criterion, logits, targets):
@@ -76,4 +135,5 @@ def mixed_loss(criterion, logits, targets):
 
     TODO. Lưu ý: accuracy trên batch đã trộn không còn nghĩa bình thường; đánh giá bằng val.
     """
-    raise NotImplementedError("TODO")
+    y_a, y_b, lam = targets
+    return lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)

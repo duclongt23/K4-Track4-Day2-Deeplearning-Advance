@@ -36,7 +36,11 @@ def load_split(labels_dir: str | Path, fold: int = 0):
       - đọc ba file CSV bằng pandas
       - trả về (train_df, val_df, test_df)
     """
-    raise NotImplementedError("TODO: đọc ba file CSV của fold được chọn")
+    labels_dir = Path(labels_dir)
+    train_df = pd.read_csv(labels_dir / f"train_subset{fold}.csv")
+    val_df = pd.read_csv(labels_dir / f"val_subset{fold}.csv")
+    test_df = pd.read_csv(labels_dir / f"test_subset{fold}.csv")
+    return train_df, val_df, test_df
 
 
 def check_split(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame,
@@ -50,7 +54,35 @@ def check_split(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFr
       4. mọi Filename đều tồn tại trong `images_dir`
     Trả về dict, ví dụ {"n": {...}, "per_class": {...}, "overlap": {...}} để dán vào báo cáo.
     """
-    raise NotImplementedError("TODO: các kiểm tra S4 ở trên")
+    n = {
+        "train": len(train_df),
+        "val": len(val_df),
+        "test": len(test_df),
+        "total": len(train_df) + len(val_df) + len(test_df)
+    }
+    
+    assert n["total"] == 17509, f"Total images expected 17509, got {n['total']}"
+    
+    train_files = set(train_df["Filename"])
+    val_files = set(val_df["Filename"])
+    test_files = set(test_df["Filename"])
+    
+    assert len(train_files.intersection(val_files)) == 0, "Train and Val overlap!"
+    assert len(train_files.intersection(test_files)) == 0, "Train and Test overlap!"
+    assert len(val_files.intersection(test_files)) == 0, "Val and Test overlap!"
+    
+    per_class = {
+        "train": train_df["Label"].value_counts().to_dict(),
+        "val": val_df["Label"].value_counts().to_dict(),
+        "test": test_df["Label"].value_counts().to_dict(),
+    }
+    
+    images_dir = Path(images_dir)
+    for f in train_files.union(val_files).union(test_files):
+        assert (images_dir / f).exists(), f"Image {f} not found in {images_dir}"
+        
+    print(f"Split Check OK! Train: {n['train']}, Val: {n['val']}, Test: {n['test']}")
+    return {"n": n, "per_class": per_class, "overlap": 0}
 
 
 def build_transforms(train: bool, img_size: int = 224, aug: str = "basic"):
@@ -65,10 +97,38 @@ def build_transforms(train: bool, img_size: int = 224, aug: str = "basic"):
 
     TODO: dùng torchvision.transforms (hoặc v2). Lưu ý: lật dọc có hợp lệ với ảnh cỏ dại không?
     """
-    raise NotImplementedError("TODO: trả về transform theo `train` và `aug`")
+    from torchvision import transforms as T
+    
+    normalize = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+    
+    if train:
+        if aug == "basic":
+            return T.Compose([
+                T.RandomResizedCrop(img_size),
+                T.RandomHorizontalFlip(),
+                T.ToTensor(),
+                normalize
+            ])
+        else:
+            return T.Compose([
+                T.RandomResizedCrop(img_size),
+                T.RandomHorizontalFlip(),
+                T.ToTensor(),
+                normalize
+            ])
+    else:
+        return T.Compose([
+            T.Resize(256),
+            T.CenterCrop(img_size),
+            T.ToTensor(),
+            normalize
+        ])
 
 
-class DeepWeedsDataset:  # TODO: kế thừa torch.utils.data.Dataset
+import torch
+from PIL import Image
+
+class DeepWeedsDataset(torch.utils.data.Dataset):
     """Dataset đọc ảnh từ `images_dir` theo DataFrame (Filename, Label).
 
     __getitem__(i) phải trả về (ảnh đã transform, nhãn int, tên file str).
@@ -82,13 +142,25 @@ class DeepWeedsDataset:  # TODO: kế thừa torch.utils.data.Dataset
     """
 
     def __init__(self, df: pd.DataFrame, images_dir: str | Path, transform=None):
-        raise NotImplementedError("TODO")
+        self.df = df
+        self.images_dir = Path(images_dir)
+        self.transform = transform
 
     def __len__(self) -> int:
-        raise NotImplementedError("TODO")
+        return len(self.df)
 
     def __getitem__(self, i: int):
-        raise NotImplementedError("TODO")
+        row = self.df.iloc[i]
+        filename = row["Filename"]
+        label = int(row["Label"])
+        
+        img_path = self.images_dir / filename
+        img = Image.open(img_path).convert("RGB")
+        
+        if self.transform is not None:
+            img = self.transform(img)
+            
+        return img, label, filename
 
 
 def make_loader(df: pd.DataFrame, images_dir: str | Path, transform, batch_size: int,
@@ -103,4 +175,21 @@ def make_loader(df: pd.DataFrame, images_dir: str | Path, transform, batch_size:
       - drop_last=True khi train nếu batch cuối quá nhỏ làm BatchNorm không ổn định
       - pin_memory=True, num_workers hợp lý; seed cho worker (worker_init_fn) để tái lập
     """
-    raise NotImplementedError("TODO")
+    dataset = DeepWeedsDataset(df, images_dir, transform=transform)
+    
+    if train and sampler == "balanced":
+        counts = df["Label"].value_counts().sort_index().values
+        weights = 1.0 / counts
+        sample_weights = [weights[l] for l in df["Label"]]
+        from torch.utils.data import WeightedRandomSampler, DataLoader
+        sampler_obj = WeightedRandomSampler(sample_weights, len(sample_weights))
+        return DataLoader(
+            dataset, batch_size=batch_size, sampler=sampler_obj,
+            num_workers=num_workers, pin_memory=True, drop_last=True
+        )
+    
+    from torch.utils.data import DataLoader
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=(train and sampler is None),
+        num_workers=num_workers, pin_memory=True, drop_last=train
+    )

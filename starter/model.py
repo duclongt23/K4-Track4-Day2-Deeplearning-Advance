@@ -8,6 +8,7 @@ Giao diện bạn phải giữ:
     param_groups(model, lr_backbone, lr_head, weight_decay)       -> list[dict] cho optimizer
     count_params(model) -> float (triệu)     count_gmacs(model, img_size) -> float
 """
+import imp
 from __future__ import annotations
 
 # Gợi ý backbone (GUIDE.md mục 2.1). Tag trọng số của timm có thể đổi theo phiên bản:
@@ -22,7 +23,7 @@ SUGGESTED_BACKBONES = {
     "mobilenetv3": "mobilenetv3_large_100",      # mạng nhẹ
 }
 
-
+import timm
 def build_model(name: str, pretrained: bool = True, num_classes: int = 9,
                 drop_rate: float = 0.0, init: str = "finetune"):
     """Tạo model phân loại 9 lớp.
@@ -38,7 +39,10 @@ def build_model(name: str, pretrained: bool = True, num_classes: int = 9,
       - nếu init == "frozen": gọi freeze_backbone(model)
       - ghi lại tên tag trọng số thực sự được tải (model.pretrained_cfg)
     """
-    raise NotImplementedError("TODO")
+    model = timm.create_model(name, pretrained=(init != "scratch"), num_classes = num_classes, drop_rate=drop_rate)
+    if init == "frozen":
+        freeze_backbone(model)
+    return model
 
 
 def freeze_backbone(model) -> None:
@@ -49,7 +53,10 @@ def freeze_backbone(model) -> None:
       - lưu ý (GUIDE.md mục 3.2): backbone đóng băng thì BatchNorm cũng phải ở chế độ eval.
         Hãy nghĩ nơi nào trong train loop phải gọi lại model.train() mà vẫn giữ BN ở eval.
     """
-    raise NotImplementedError("TODO")
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in model.get_classifier().parameters():
+        param.requires_grad = True
 
 
 def param_groups(model, lr_backbone: float, lr_head: float, weight_decay: float):
@@ -64,12 +71,37 @@ def param_groups(model, lr_backbone: float, lr_head: float, weight_decay: float)
       - trả về list[dict] dạng {"params": [...], "lr": ..., "weight_decay": ...}
       - (trục E) mở rộng: LR theo tầng nếu bạn muốn thử
     """
-    raise NotImplementedError("TODO")
+    groups = []
+    backbone_params = []
+    backbone_norm_bias = []
+    
+    classifier_params = set(model.get_classifier().parameters())
+    
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        if p in classifier_params:
+            continue
+        if p.ndim <= 1:
+            backbone_norm_bias.append(p)
+        else:
+            backbone_params.append(p)
+            
+    if backbone_params:
+        groups.append({"params": backbone_params, "lr": lr_backbone, "weight_decay": weight_decay})
+    if backbone_norm_bias:
+        groups.append({"params": backbone_norm_bias, "lr": lr_backbone, "weight_decay": 0.0})
+        
+    head_params = [p for p in classifier_params if p.requires_grad]
+    if head_params:
+        groups.append({"params": head_params, "lr": lr_head, "weight_decay": weight_decay})
+        
+    return groups
 
 
 def count_params(model) -> float:
     """Số tham số (triệu), đếm cả tham số bị đóng băng. TODO."""
-    raise NotImplementedError("TODO")
+    return sum(p.numel() for p in model.parameters()) / 1e6
 
 
 def count_gmacs(model, img_size: int = 224) -> float:
@@ -78,4 +110,11 @@ def count_gmacs(model, img_size: int = 224) -> float:
     TODO: dùng thư viện đếm (fvcore, ptflops, thop...) hoặc tự đếm bằng hook.
     Ghi rõ công cụ đã dùng; số có thể lệch vài phần trăm giữa các công cụ.
     """
-    raise NotImplementedError("TODO")
+    try:
+        from thop import profile
+        import torch
+        dummy = torch.randn(1, 3, img_size, img_size)
+        macs, _ = profile(model, inputs=(dummy,), verbose=False)
+        return macs / 1e9
+    except ImportError:
+        return 0.0
