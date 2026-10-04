@@ -138,26 +138,33 @@ def apply_temperature(logits, T: float):
     return F.softmax(logits_t / float(T), dim=-1).numpy()
 
 
-def fuse_conv_bn(model):
+def fuse_conv_bn(model, check_input_size: int = 224, tol: float = 1e-3):
     """Gộp BatchNorm vào tích chập liền trước, chính xác lúc suy luận (slide trang 71, 75).
-    Với kiến trúc không có BN (ViT, Swin, ConvNeXt dùng LayerNorm), giữ nguyên mô hình.
+
+    Duyệt từng module: nếu hai con liên tiếp là (Conv2d, BatchNorm2d) thì gộp. Với `BatchNormAct2d` của timm
+    (BN + kích hoạt trong một module) thay BN bằng đúng lớp kích hoạt của nó, để không mất ReLU/SiLU.
+    Sau khi gộp, so sánh logit với model gốc trên đầu vào ngẫu nhiên; nếu lệch quá `tol` thì trả lại model gốc.
+    Kiến trúc không có BN (ViT, Swin, ConvNeXt dùng LayerNorm) cho kết quả không đổi (số cặp gộp = 0).
+    Gán `model_fused.n_fused` = số cặp đã gộp.
     """
-    model_fused = copy.deepcopy(model).eval()
-    
-    # Duyệt đệ quy để gộp Conv2d + BatchNorm2d
-    def _fuse_modules(m):
-        for name, child in m.named_children():
-            if isinstance(child, nn.Sequential):
-                for i in range(len(child) - 1):
-                    if isinstance(child[i], nn.Conv2d) and isinstance(child[i + 1], nn.BatchNorm2d):
-                        child[i] = fuse_conv_bn_eval(child[i], child[i + 1])
-                        child[i + 1] = nn.Identity()
-            _fuse_modules(child)
-
-    try:
-        _fuse_modules(model_fused)
-    except Exception as e:
-        print(f"fuse_conv_bn: Không thể gộp (kiến trúc có thể dùng LayerNorm/GroupNorm): {e}")
-        return model.eval()
-
-    return model_fused
+    fused = copy.deepcopy(model).cpu().eval()
+    n = 0
+    for parent in fused.modules():
+        names = list(parent._modules.keys())
+        for i in range(len(names) - 1):
+            conv, bn = parent._modules[names[i]], parent._modules[names[i + 1]]
+            if (isinstance(conv, nn.Conv2d) and isinstance(bn, nn.BatchNorm2d)
+                    and bn.num_features == conv.out_channels and bn.track_running_stats):
+                parent._modules[names[i]] = fuse_conv_bn_eval(conv, bn)
+                parent._modules[names[i + 1]] = getattr(bn, "act", None) or nn.Identity()
+                n += 1
+    ref = copy.deepcopy(model).cpu().eval()
+    x = torch.randn(2, 3, check_input_size, check_input_size)
+    with torch.inference_mode():
+        err = (ref(x) - fused(x)).abs().max().item()
+    if err > tol:
+        print(f"fuse_conv_bn: lệch {err:.2e} > {tol}, giữ model gốc")
+        ref.n_fused = 0
+        return ref
+    fused.n_fused = n
+    return fused

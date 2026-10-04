@@ -1,6 +1,5 @@
 """model.py - tạo backbone, đóng băng, nhóm tham số, đếm params/GMAC.
 
-PSEUDO-CODE: bạn tự hoàn thiện mọi hàm có `raise NotImplementedError`.
 
 Giao diện bạn phải giữ:
     build_model(name, pretrained, num_classes, drop_rate, init) -> nn.Module
@@ -8,8 +7,12 @@ Giao diện bạn phải giữ:
     param_groups(model, lr_backbone, lr_head, weight_decay)       -> list[dict] cho optimizer
     count_params(model) -> float (triệu)     count_gmacs(model, img_size) -> float
 """
-import imp
 from __future__ import annotations
+
+import copy
+
+import timm
+import torch
 
 # Gợi ý backbone (GUIDE.md mục 2.1). Tag trọng số của timm có thể đổi theo phiên bản:
 # dùng timm.list_pretrained("resnet50*") để xem, và GHI LẠI tag bạn dùng trong results.xlsx.
@@ -23,7 +26,7 @@ SUGGESTED_BACKBONES = {
     "mobilenetv3": "mobilenetv3_large_100",      # mạng nhẹ
 }
 
-import timm
+
 def build_model(name: str, pretrained: bool = True, num_classes: int = 9,
                 drop_rate: float = 0.0, init: str = "finetune"):
     """Tạo model phân loại 9 lớp.
@@ -33,22 +36,30 @@ def build_model(name: str, pretrained: bool = True, num_classes: int = 9,
       - "frozen"   : pretrained=True, đóng băng backbone, chỉ train head
       - "finetune" : pretrained=True, train toàn bộ
 
-    TODO:
+    Cách làm:
       - timm.create_model(name, pretrained=..., num_classes=num_classes, drop_rate=...)
         (timm tự thay head mới; head khởi tạo ngẫu nhiên)
       - nếu init == "frozen": gọi freeze_backbone(model)
       - ghi lại tên tag trọng số thực sự được tải (model.pretrained_cfg)
     """
-    model = timm.create_model(name, pretrained=(init != "scratch"), num_classes = num_classes, drop_rate=drop_rate)
+    if init not in ("scratch", "frozen", "finetune"):
+        raise ValueError(f"init phải là scratch | frozen | finetune, nhận {init!r}")
+    model = timm.create_model(name, pretrained=(init != "scratch"), num_classes=num_classes, drop_rate=drop_rate)
     if init == "frozen":
         freeze_backbone(model)
     return model
 
 
+def weights_tag(model) -> str:
+    """Tag trọng số timm thực sự được tải (ghi vào results.xlsx, cột `tag trọng số`)."""
+    cfg = getattr(model, "pretrained_cfg", None) or {}
+    return str(cfg.get("tag") or cfg.get("hf_hub_id") or cfg.get("url") or "none")
+
+
 def freeze_backbone(model) -> None:
     """Đóng băng mọi tham số trừ head.
 
-    TODO:
+    Cách làm:
       - requires_grad = False cho tham số backbone; head (model.get_classifier()) vẫn train
       - lưu ý (GUIDE.md mục 3.2): backbone đóng băng thì BatchNorm cũng phải ở chế độ eval.
         Hãy nghĩ nơi nào trong train loop phải gọi lại model.train() mà vẫn giữ BN ở eval.
@@ -66,7 +77,7 @@ def param_groups(model, lr_backbone: float, lr_head: float, weight_decay: float)
     - norm và bias của backbone (ndim <= 1): lr = lr_backbone, weight_decay = 0
     - head mới: lr = lr_head (thường gấp 10 lần backbone), weight_decay = weight_decay
 
-    TODO:
+    Cách làm:
       - bỏ qua tham số requires_grad == False
       - trả về list[dict] dạng {"params": [...], "lr": ..., "weight_decay": ...}
       - (trục E) mở rộng: LR theo tầng nếu bạn muốn thử
@@ -74,13 +85,13 @@ def param_groups(model, lr_backbone: float, lr_head: float, weight_decay: float)
     groups = []
     backbone_params = []
     backbone_norm_bias = []
-    
-    classifier_params = set(model.get_classifier().parameters())
-    
+
+    classifier_ids = {id(p) for p in model.get_classifier().parameters()}
+
     for p in model.parameters():
         if not p.requires_grad:
             continue
-        if p in classifier_params:
+        if id(p) in classifier_ids:
             continue
         if p.ndim <= 1:
             backbone_norm_bias.append(p)
@@ -92,7 +103,7 @@ def param_groups(model, lr_backbone: float, lr_head: float, weight_decay: float)
     if backbone_norm_bias:
         groups.append({"params": backbone_norm_bias, "lr": lr_backbone, "weight_decay": 0.0})
         
-    head_params = [p for p in classifier_params if p.requires_grad]
+    head_params = [p for p in model.get_classifier().parameters() if p.requires_grad]
     if head_params:
         groups.append({"params": head_params, "lr": lr_head, "weight_decay": weight_decay})
         
@@ -100,21 +111,22 @@ def param_groups(model, lr_backbone: float, lr_head: float, weight_decay: float)
 
 
 def count_params(model) -> float:
-    """Số tham số (triệu), đếm cả tham số bị đóng băng. TODO."""
+    """Số tham số (triệu), đếm cả tham số bị đóng băng.."""
     return sum(p.numel() for p in model.parameters()) / 1e6
 
 
 def count_gmacs(model, img_size: int = 224) -> float:
-    """GMAC cho một ảnh 3 x img_size x img_size (slide tính MAC, không phải FLOPs 2x).
+    """GMAC cho một ảnh 3 x img_size x img_size (MAC, không phải FLOPs 2x), đếm bằng `thop`.
 
-    TODO: dùng thư viện đếm (fvcore, ptflops, thop...) hoặc tự đếm bằng hook.
-    Ghi rõ công cụ đã dùng; số có thể lệch vài phần trăm giữa các công cụ.
+    Chạy trên bản sao ở CPU để không làm bẩn model gốc (thop gắn thêm buffer vào module).
+    Trả về nan nếu không có thop (cài bằng `pip install thop`).
     """
     try:
         from thop import profile
-        import torch
-        dummy = torch.randn(1, 3, img_size, img_size)
-        macs, _ = profile(model, inputs=(dummy,), verbose=False)
-        return macs / 1e9
     except ImportError:
-        return 0.0
+        return float("nan")
+    m = copy.deepcopy(model).cpu().eval()
+    dummy = torch.randn(1, 3, img_size, img_size)
+    with torch.no_grad():
+        macs, _ = profile(m, inputs=(dummy,), verbose=False)
+    return macs / 1e9

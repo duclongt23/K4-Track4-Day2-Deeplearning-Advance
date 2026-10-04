@@ -1,6 +1,5 @@
 """dataset.py - đọc DeepWeeds, kiểm tra chia dữ liệu, transform, DataLoader.
 
-PSEUDO-CODE: bạn tự hoàn thiện mọi hàm có `raise NotImplementedError`.
 Quy tắc chia dữ liệu bắt buộc (S1-S6) nằm ở README.md, mục 2.1. Đọc trước khi viết.
 
 Giao diện bạn phải giữ (để notebook, train.py và eval.py ghép được với nhau):
@@ -15,6 +14,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import torch
+from PIL import Image
 
 NUM_CLASSES = 9
 # Thứ tự lớp theo cột `Label` của labels.csv (0 = Chinee Apple ... 7 = Snake Weed, 8 = Negatives).
@@ -32,7 +33,7 @@ def load_split(labels_dir: str | Path, fold: int = 0):
     Mỗi file có cột `Filename, Label, Species`. Trả về ba DataFrame.
     KHÔNG sửa, lọc hay chia lại dữ liệu.
 
-    TODO:
+    Cách làm:
       - đọc ba file CSV bằng pandas
       - trả về (train_df, val_df, test_df)
     """
@@ -47,7 +48,7 @@ def check_split(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFr
                 images_dir: str | Path) -> dict:
     """Kiểm tra bắt buộc trước khi train (README.md, mục 2.1). In ra và trả về dict số liệu.
 
-    TODO kiểm tra, mỗi ý lỗi thì `assert` / raise để dừng ngay:
+    Kiểm tra, mỗi ý lỗi thì `assert` / raise để dừng ngay:
       1. số ảnh mỗi tập và số ảnh mỗi lớp trong từng tập (kỳ vọng xấp xỉ 60/20/20)
       2. giao của từng cặp tập theo Filename phải RỖNG (train∩val, train∩test, val∩test)
       3. hợp ba tập phải bằng đúng 17.509 ảnh
@@ -55,34 +56,35 @@ def check_split(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFr
     Trả về dict, ví dụ {"n": {...}, "per_class": {...}, "overlap": {...}} để dán vào báo cáo.
     """
     n = {
-        "train": len(train_df),
-        "val": len(val_df),
-        "test": len(test_df),
-        "total": len(train_df) + len(val_df) + len(test_df)
+        "train": len(train_df), "val": len(val_df), "test": len(test_df),
+        "total": len(train_df) + len(val_df) + len(test_df),
     }
-    
-    assert n["total"] == 17509, f"Total images expected 17509, got {n['total']}"
-    
-    train_files = set(train_df["Filename"])
-    val_files = set(val_df["Filename"])
-    test_files = set(test_df["Filename"])
-    
-    assert len(train_files.intersection(val_files)) == 0, "Train and Val overlap!"
-    assert len(train_files.intersection(test_files)) == 0, "Train and Test overlap!"
-    assert len(val_files.intersection(test_files)) == 0, "Val and Test overlap!"
-    
+    assert n["total"] == 17509, f"Tổng số ảnh phải là 17509, nhận {n['total']}"
+    for k in ("train", "val", "test"):
+        ratio = n[k] / n["total"]
+        expected = {"train": 0.6, "val": 0.2, "test": 0.2}[k]
+        assert abs(ratio - expected) < 0.01, f"Tỉ lệ {k} = {ratio:.3f}, lệch quá 1 điểm % so với {expected}"
+
+    files = {"train": set(train_df["Filename"]), "val": set(val_df["Filename"]), "test": set(test_df["Filename"])}
+    overlap = {
+        "train&val": len(files["train"] & files["val"]),
+        "train&test": len(files["train"] & files["test"]),
+        "val&test": len(files["val"] & files["test"]),
+    }
+    assert all(v == 0 for v in overlap.values()), f"Giao các tập phải rỗng: {overlap}"
+    assert len(files["train"] | files["val"] | files["test"]) == 17509, "Hợp ba tập phải đúng 17509 ảnh"
+
     per_class = {
-        "train": train_df["Label"].value_counts().to_dict(),
-        "val": val_df["Label"].value_counts().to_dict(),
-        "test": test_df["Label"].value_counts().to_dict(),
+        name: df["Label"].value_counts().sort_index().to_dict()
+        for name, df in (("train", train_df), ("val", val_df), ("test", test_df))
     }
-    
+
     images_dir = Path(images_dir)
-    for f in train_files.union(val_files).union(test_files):
-        assert (images_dir / f).exists(), f"Image {f} not found in {images_dir}"
-        
-    print(f"Split Check OK! Train: {n['train']}, Val: {n['val']}, Test: {n['test']}")
-    return {"n": n, "per_class": per_class, "overlap": 0}
+    missing = [f for f in sorted(files["train"] | files["val"] | files["test"]) if not (images_dir / f).exists()]
+    assert not missing, f"{len(missing)} file không có trong {images_dir}, ví dụ {missing[:3]}"
+
+    print(f"Split OK | train {n['train']} val {n['val']} test {n['test']} (tổng {n['total']}) | giao rỗng | đủ file ảnh")
+    return {"n": n, "per_class": per_class, "overlap": overlap, "missing_files": 0}
 
 
 def build_transforms(train: bool, img_size: int = 224, aug: str = "basic"):
@@ -95,38 +97,31 @@ def build_transforms(train: bool, img_size: int = 224, aug: str = "basic"):
     Val/test: ảnh gốc 256x256 -> CenterCrop(img_size) (hoặc giữ nguyên 256; ghi rõ bạn chọn gì)
               + ToTensor + Normalize. KHÔNG augmentation ngẫu nhiên khi đánh giá.
 
-    TODO: dùng torchvision.transforms (hoặc v2). Lưu ý: lật dọc có hợp lệ với ảnh cỏ dại không?
+    dùng torchvision.transforms (hoặc v2). Lưu ý: lật dọc có hợp lệ với ảnh cỏ dại không?
     """
     from torchvision import transforms as T
-    
+
     normalize = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-    
-    if train:
-        if aug == "basic":
-            return T.Compose([
-                T.RandomResizedCrop(img_size),
-                T.RandomHorizontalFlip(),
-                T.ToTensor(),
-                normalize
-            ])
-        else:
-            return T.Compose([
-                T.RandomResizedCrop(img_size),
-                T.RandomHorizontalFlip(),
-                T.ToTensor(),
-                normalize
-            ])
+
+    if not train:
+        # Ảnh gốc 256x256. img_size <= 256: giữ 256 rồi CenterCrop(img_size); img_size > 256 (dò độ phân giải,
+        # trục I04): phóng lên img_size, không crop. KHÔNG augmentation ngẫu nhiên khi đánh giá.
+        return T.Compose([T.Resize(max(256, img_size)), T.CenterCrop(img_size), T.ToTensor(), normalize])
+
+    # Chỉ lật ngang. Lật dọc/xoay chưa được kiểm chứng cho ảnh cỏ dại, nên không đưa vào nền (có thể thử riêng).
+    geo = [T.RandomResizedCrop(img_size), T.RandomHorizontalFlip()]
+    if aug == "basic":
+        extra = []
+    elif aug == "color":
+        extra = [T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05)]
+    elif aug == "trivial":
+        extra = [T.TrivialAugmentWide()]
+    elif aug == "randaug":
+        extra = [T.RandAugment(num_ops=2, magnitude=9)]
     else:
-        return T.Compose([
-            T.Resize(256),
-            T.CenterCrop(img_size),
-            T.ToTensor(),
-            normalize
-        ])
+        raise ValueError(f"aug không hợp lệ: {aug!r} (basic | color | trivial | randaug)")
+    return T.Compose(geo + extra + [T.ToTensor(), normalize])
 
-
-import torch
-from PIL import Image
 
 class DeepWeedsDataset(torch.utils.data.Dataset):
     """Dataset đọc ảnh từ `images_dir` theo DataFrame (Filename, Label).
@@ -134,7 +129,7 @@ class DeepWeedsDataset(torch.utils.data.Dataset):
     __getitem__(i) phải trả về (ảnh đã transform, nhãn int, tên file str).
     Tên file cần có để ghi `predictions/*.csv` đúng định dạng của eval.py.
 
-    TODO:
+    Cách làm:
       - __init__(self, df, images_dir, transform): giữ df, mở ảnh bằng PIL, chuyển sang RGB
       - __len__
       - __getitem__ -> (tensor, int(label), filename)
@@ -167,7 +162,7 @@ def make_loader(df: pd.DataFrame, images_dir: str | Path, transform, batch_size:
                 train: bool, sampler: str | None = None, num_workers: int = 2):
     """Tạo DataLoader.
 
-    TODO:
+    Cách làm:
       - train=True: shuffle (hoặc dùng sampler); train=False: không shuffle, giữ thứ tự df
         (thứ tự phải ổn định để ghép logit với Filename)
       - sampler=None | "balanced": "balanced" dùng WeightedRandomSampler với trọng số
@@ -175,21 +170,27 @@ def make_loader(df: pd.DataFrame, images_dir: str | Path, transform, batch_size:
       - drop_last=True khi train nếu batch cuối quá nhỏ làm BatchNorm không ổn định
       - pin_memory=True, num_workers hợp lý; seed cho worker (worker_init_fn) để tái lập
     """
+    from torch.utils.data import DataLoader, WeightedRandomSampler
+
     dataset = DeepWeedsDataset(df, images_dir, transform=transform)
-    
+    pin = torch.cuda.is_available()
+    common = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=pin, drop_last=train,
+                  worker_init_fn=_seed_worker, persistent_workers=num_workers > 0)
+
     if train and sampler == "balanced":
-        counts = df["Label"].value_counts().sort_index().values
-        weights = 1.0 / counts
-        sample_weights = [weights[l] for l in df["Label"]]
-        from torch.utils.data import WeightedRandomSampler, DataLoader
-        sampler_obj = WeightedRandomSampler(sample_weights, len(sample_weights))
-        return DataLoader(
-            dataset, batch_size=batch_size, sampler=sampler_obj,
-            num_workers=num_workers, pin_memory=True, drop_last=True
-        )
-    
-    from torch.utils.data import DataLoader
-    return DataLoader(
-        dataset, batch_size=batch_size, shuffle=(train and sampler is None),
-        num_workers=num_workers, pin_memory=True, drop_last=train
-    )
+        counts = df["Label"].value_counts().sort_index()
+        w = 1.0 / counts
+        sample_weights = df["Label"].map(w).to_numpy()
+        return DataLoader(dataset, sampler=WeightedRandomSampler(sample_weights, len(sample_weights)), **common)
+    if sampler not in (None, "balanced"):
+        raise ValueError(f"sampler không hợp lệ: {sampler!r}")
+    return DataLoader(dataset, shuffle=train, **common)
+
+
+def _seed_worker(worker_id: int) -> None:
+    """Seed cho worker của DataLoader (numpy/random) từ seed torch của tiến trình chính."""
+    import random
+    import numpy as np
+    seed = torch.initial_seed() % 2**32
+    np.random.seed(seed)
+    random.seed(seed)

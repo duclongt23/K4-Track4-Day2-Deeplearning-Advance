@@ -42,70 +42,61 @@ def bench(fn, warmup: int = 10, iters: int = 100, sync=None) -> dict:
 
 def latency_report(model, batch_size: int, img_size: int, dtype: str = "fp32", device: str = "cuda",
                    warmup: int = 10, iters: int = 100) -> dict:
-    """Đo độ trễ forward của `model` với đầu vào ngẫu nhiên (batch_size, 3, img_size, img_size).
-    Trả về dict có thể ghi thẳng vào sheet `Latency` của results.xlsx.
-    """
-    dev = torch.device(device if (torch.cuda.is_available() and "cuda" in device) else "cpu")
-    model = model.to(dev)
-    model.eval()
+    """Đo độ trễ forward (chỉ model, không tính tiền xử lý) với đầu vào ngẫu nhiên (B, 3, S, S).
 
+    dtype: "fp32" | "amp" (autocast fp16) | "fp16" (model.half()). Model truyền vào được sao chép nên
+    không bị đổi dtype/thiết bị. Trả về dict ghi thẳng được vào sheet `Latency` của results.xlsx.
+    """
+    import copy
+    dev = torch.device(device if (torch.cuda.is_available() and "cuda" in device) else "cpu")
+    model = copy.deepcopy(model).to(dev).eval()
     sync = torch.cuda.synchronize if dev.type == "cuda" else None
     x = torch.randn(batch_size, 3, img_size, img_size, device=dev)
 
     if dtype == "fp16":
-        model = model.half()
-        x = x.half()
+        model, x = model.half(), x.half()
         fn = lambda: model(x)
     elif dtype == "amp":
-        fn = lambda: torch.cuda.amp.autocast()(model)(x) if dev.type == "cuda" else model(x)
-    else:  # fp32
+        def fn():
+            with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
+                return model(x)
+    elif dtype == "fp32":
         model = model.float()
-        x = x.float()
         fn = lambda: model(x)
+    else:
+        raise ValueError(f"dtype phải là fp32 | amp | fp16, nhận {dtype!r}")
 
     with torch.inference_mode():
         res = bench(fn, warmup=warmup, iters=iters, sync=sync)
 
-    gpu_name = torch.cuda.get_device_name(0) if dev.type == "cuda" else "CPU"
-    p50 = res["p50"]
-    images_per_s = float(batch_size / (p50 / 1000.0)) if p50 > 0 else 0.0
-
     res.update({
-        "gpu": gpu_name,
-        "dtype": dtype,
-        "batch": batch_size,
-        "img_size": img_size,
-        "images_per_s": images_per_s,
+        "gpu": torch.cuda.get_device_name(0) if dev.type == "cuda" else "CPU",
+        "dtype": dtype, "batch": batch_size, "img_size": img_size,
+        "images_per_s": float(batch_size / (res["p50"] / 1000.0)) if res["p50"] > 0 else 0.0,
         "torch": torch.__version__,
     })
     return res
 
 
-def tta_latency(model, k_views: int = 2, **kw) -> dict:
-    """Đo độ trễ của TTA K view: so sánh độ trễ thực tế với K * p50."""
-    single_res = latency_report(model, **kw)
-    batch_size = kw.get("batch_size", 1)
-    img_size = kw.get("img_size", 224)
-    dtype = kw.get("dtype", "fp32")
-    device = kw.get("device", "cuda")
-    warmup = kw.get("warmup", 10)
-    iters = kw.get("iters", 50)
-
+def tta_latency(model, k_views: int = 2, batch_size: int = 1, img_size: int = 224, dtype: str = "fp32",
+                device: str = "cuda", warmup: int = 10, iters: int = 50) -> dict:
+    """Độ trễ của TTA K view (K lần forward liên tiếp) so với K * p50 của 1 view (slide trang 63)."""
+    single = latency_report(model, batch_size, img_size, dtype, device, warmup, iters)
     dev = torch.device(device if (torch.cuda.is_available() and "cuda" in device) else "cpu")
-    sync = torch.cuda.synchronize if dev.type == "cuda" else None
+    import copy
+    m = copy.deepcopy(model).to(dev).eval()
     x = torch.randn(batch_size, 3, img_size, img_size, device=dev)
+    if dtype == "fp16":
+        m, x = m.half(), x.half()
+    sync = torch.cuda.synchronize if dev.type == "cuda" else None
 
     def tta_fn():
-        for _ in range(k_views):
-            _ = model(x)
+        with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=(dtype == "amp" and dev.type == "cuda")):
+            for _ in range(k_views):
+                m(x)
 
     with torch.inference_mode():
-        tta_res = bench(tta_fn, warmup=warmup, iters=iters, sync=sync)
-
-    tta_res.update({
-        "single_p50": single_res["p50"],
-        "k_views": k_views,
-        "expected_k_p50": single_res["p50"] * k_views,
-        "overhead_ratio": tta_res["p50"] / (single_res["p50"] * k_views) if single_res["p50"] > 0 else 1.0,
-    })
-    return tta_res
+        res = bench(tta_fn, warmup=warmup, iters=iters, sync=sync)
+    res.update({"single_p50": single["p50"], "k_views": k_views, "expected_k_p50": single["p50"] * k_views,
+                "ratio_vs_k_times_single": res["p50"] / (single["p50"] * k_views) if single["p50"] > 0 else float("nan")})
+    return res
